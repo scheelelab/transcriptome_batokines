@@ -1,0 +1,395 @@
+---
+title: "Discovering batokines from BAT RNA-seq"
+author: Nagendra Palani / nagendra.palani@sund.ku.dk
+owner: Camilla Schéele / cs@sund.ku.dk / Schéele Lab - Novo Nordisk Foundation Center for Basic Metabolic Research
+updated: 03-Nov-2020
+output:
+  pdf_document: default
+  html_notebook: default
+editor_options: 
+    chunk_output_type: inline
+---
+updated: 03-Nov-2020
+
+### Preprocessing
+In vitro cultures of brown adipocytes treated with +/- norepinephrine were subject to RNA-seq. Fastq files were aligned with STAR to human ref. genome and then counts collated using featureCounts (ensembl 101). See GEO accession GSE150119 - supraclavicular adipose tissue samples GSM4523813 - GSM452382 for sequencing data.
+
+NOTE: log2FC is calculated for NE/control here.
+
+#### Dependencies
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(DESeq2)
+library(DEGreport)
+library(patchwork)
+library(readr)
+library(RColorBrewer)
+library(biomaRt)
+library(pheatmap)
+library(ggthemes)
+library(EnhancedVolcano)
+
+```
+
+
+#### Samples from subject 2 were excluded as the samples had an outsized influence from the subject and not the treatment.
+
+```{r}
+
+# setwd to ~/Documents/sus_invivocool/bat_NE_vs_control_final
+
+
+ cts <- read_delim("featcount_batcontrolvsne.txt", "\t", escape_double = FALSE, col_types = cols(Chr = col_skip(), Start = col_skip(), End = col_skip(), Strand = col_skip(), Length = col_skip(),`3_sample` = col_skip(),`4_sample`=col_skip()), trim_ws = TRUE)
+
+coldata <- read_csv("bat_controlne_cleaned_coldata.csv", col_types = cols(condition = col_factor(levels = c("control", "treated")), subject = col_factor(levels = c("1", "3", "4","5"))))
+```
+
+#### Check if count samples names and coldata sample names match
+```{r}
+cts <- data.frame(cts, row.names = 1)
+coldata <- data.frame(coldata, row.names = 1)
+
+# rearrange columns of cts based on coldata order.
+cts <- cts[,rownames(coldata)]
+all(rownames(coldata) == colnames(cts))
+```
+
+#### Assemble DESeq object
+```{r}
+dds <- DESeqDataSetFromMatrix(countData = cts,
+                              colData = coldata,
+                              design = ~ subject + condition)
+
+dds$tissue <- relevel(dds$condition, ref = "control")
+
+dds
+```
+
+#### Run DESeq
+```{r}
+dds <- DESeq(dds)
+res <- results(dds)
+res
+```
+
+#### Plot dispersion estimate
+```{r}
+plotDispEsts(dds)
+```
+
+#### Calculate rlog of counts for sample distance plots etc.
+```{r}
+rld <- rlog(dds, blind=TRUE)
+rld_mat <- assay(rld)
+```
+
+#### Sample Distance plot
+```{r}
+sampleDists <- dist(t(assay(rld)))
+
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- paste(rld$condition, rld$subject, sep="-")
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows=sampleDists,
+         clustering_distance_cols=sampleDists,
+         col=colors)
+```
+#### PCA plot to see separation of samples. 
+```{r}
+pcaData <- plotPCA(rld, intgroup=c("condition","subject"), returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+pca_allgenes <- ggplot(pcaData, aes(PC1, PC2, color=condition, shape=subject)) +
+  geom_jitter(size=3,width=1.5) + geom_vline(xintercept = 0,linetype = 2,colour="black") +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed() + theme_classic() 
+
+pca_allgenes
+```
+
+#### Summary of DE result
+```{r}
+resOrdered <- res[order(res$pvalue),]
+resSig <- subset(resOrdered, padj < 0.05)
+siggenes <- as.data.frame(resSig)
+
+
+
+res05 <- results(dds, alpha=0.05)
+summary(res05)
+
+# Normalized counts
+normalized_counts <- counts(dds, normalized=T)
+```
+
+#### Annotate DE genes using BiomaRt
+```{r}
+siggenedf <- data.frame(ensemblid = row.names(siggenes), siggenes,stringsAsFactors=FALSE)
+rownames(siggenedf) <- NULL
+
+mart <- useDataset("hsapiens_gene_ensembl", useMart("ensembl"))
+
+G_list <- getBM(filters= "ensembl_gene_id", attributes= c("ensembl_gene_id","hgnc_symbol","gene_biotype","description"),values=siggenedf$ensemblid,mart= mart)
+de_list_all <- merge(siggenedf,G_list,by.x="ensemblid",by.y="ensembl_gene_id")
+
+# Uncomment line below to get csv file of DE genes.
+#write.csv(de_list_all, "bat_NE_vs_control_sub2excluded.csv")
+
+
+```
+
+#### Import list of secreted genes from Uhlen et al 2019 Science Signaling paper.
+#### Subset the DE genes to contain only the secreted genes. Set lfcSE to =< 0.5
+```{r}
+secprot <- read_delim("secreted_proteins_list.txt", "\t", escape_double = FALSE, trim_ws = TRUE)
+secprot$annotcategory <- as.factor(secprot$annotcategory)
+
+sigsecgenes <- inner_join(de_list_all,secprot,by="ensemblid")
+
+sigsecgenes <- filter(sigsecgenes,lfcSE <= 0.5)
+```
+
+
+#### Data for Table 1 : BAT secretome summary by secretion location.
+```{r}
+# 
+totsecprot <- table(secprot$annotcategory) %>% as.data.frame()
+batnesecprot <- table(sigsecgenes$annotcategory)%>% as.data.frame()
+
+
+batup_seclist <- sigsecgenes %>% filter(log2FoldChange > 0)
+batup_sec <- table(batup_seclist$annotcategory)%>% as.data.frame()
+
+batdown_seclist <- sigsecgenes %>% filter(log2FoldChange < 0)
+batdown_sec <- table(batdown_seclist$annotcategory)%>% as.data.frame()
+
+ff <- secprot$ensemblid %in% rownames(normalized_counts) 
+secgenes_normcount <- normalized_counts[secprot$ensemblid[ff],]
+
+# number of secreted genes that have a cumulative read count of > 10 across samples.
+summary(rowSums(secgenes_normcount) >= 10)
+```
+
+
+#### Heatmap of secreted genes n = 550
+```{r}
+# 
+
+### Extract normalized expression for significant genes
+
+
+sigsecgenes <- arrange(sigsecgenes,annotcategory)
+normcount_sig <- normalized_counts[sigsecgenes$ensemblid,]
+
+my_sample_col <- data.frame(treatment = coldata$condition, subject=coldata$subject )
+row.names(my_sample_col) <- colnames(normcount_sig)
+
+heat.colors <- brewer.pal(5, "RdYlGn")
+
+pheatmap(normcount_sig, color = heat.colors, cluster_rows = T,  show_rownames=F, cluster_cols = T, border_color=NA, fontsize = 10, scale="row",fontsize_row = 1, annotation_col = my_sample_col,cutree_cols = 2,treeheight_row = 0,treeheight_col=10,show_colnames = F, cellheight=0.25, cellwidth=10,annotation_names_col=F,width=5, height=5) 
+
+# to save heatmap as pdf, add the following argument to the pheatmap command.
+#filename="transbato_heatmap_pdf.pdf"
+
+
+```
+
+#### GO analysis
+```{r}
+#retrieve GO terms for genes from biomart 
+go_list <- getBM(filters= "ensembl_gene_id", attributes= c("ensembl_gene_id","hgnc_symbol","go_id","name_1006","definition_1006","namespace_1003"),values=sigsecgenes$ensemblid,mart= mart)
+
+```
+After retrieving the GO terms for all the secreted genes, the list was opened in an text editor and the genes which had the GO categories 
+
+Cell differentiation (GO:0030154)
+Hormone activity (GO:0005179)
+Growth factor activity (GO:0008083) 
+
+were extracted. Next, from these lists, only those genes that had a log2FC > 1 were retained. The gene INHBA was common to all three categories, so that was dropped for visualization. Each GO gene list was then assigned a unique color for labeling on the Volcano plot.
+
+The lists were imported into R.
+
+```{r message=FALSE}
+
+# Get upregulated genes for each GO category
+genes_celldiff <- read_csv("genes_celldiff.txt", col_names = FALSE)
+genes_hormoneactivity <- read_csv("genes_hormoneactivity.txt", col_names = FALSE)
+genes_growthfactor <- read_csv("genes_growthactivity.txt", col_names = FALSE)
+
+celldiff_de <- sigsecgenes %>% inner_join(genes_celldiff,by=c("ensemblid"="X1")) 
+celldiff_de_pos <- celldiff_de %>% filter(log2FoldChange >=1 ) %>% .[,8]
+
+hormact_de <- sigsecgenes %>% inner_join(genes_hormoneactivity,by=c("ensemblid"="X1")) 
+hormact_de_pos <- hormact_de %>% filter(log2FoldChange >=1 ) %>% .[,8]
+
+growthfac_de <- sigsecgenes %>% inner_join(genes_growthfactor,by=c("ensemblid"="X1")) 
+growthfac_de_pos <- growthfac_de  %>% filter(log2FoldChange >=1 ) %>% .[,8]
+
+#get upregulated genes from all DE secreted genes
+topreggenes <- sigsecgenes %>% filter(abs(log2FoldChange) >=1.5 ) %>% .[,8]
+
+#remove INHBA
+celldiff_de_pos <- celldiff_de_pos[!celldiff_de_pos %in% "INHBA"]
+hormact_de_pos <- hormact_de_pos[!hormact_de_pos %in% "INHBA"]
+growthfac_de_pos <- growthfac_de_pos[!growthfac_de_pos %in% "INHBA"]
+
+
+#make non-redundant list of genes for labeling
+
+topdiffs <- Reduce(setdiff, list(A = topreggenes,
+                              B = celldiff_de_pos,
+                              C = growthfac_de_pos,
+                              D = hormact_de_pos
+                              ))
+
+
+volc_genes <- c(celldiff_de_pos,hormact_de_pos,growthfac_de_pos,topdiffs)
+
+
+# set custom color for EnhancedVolcano plot
+keyvals.colour2 <- ifelse(abs(sigsecgenes$log2FoldChange) > 1, '#2CA02C','#C7C7C7')
+keyvals.colour2[is.na(keyvals.colour2)] <- '#C7C7C7'
+names(keyvals.colour2)[keyvals.colour2 == '#2CA02C'] <- 'Highly expressed genes'
+names(keyvals.colour2)[keyvals.colour2 == '#C7C7C7'] <- 'Other'
+
+```
+
+
+#### NOTE: The volcano plot generated below was saved as svg, imported into Inkscape, and then the label colors & legends were manually set to generate the figure seen in the manuscript. Some labels were added/removed for emphasis/clarity.
+```{r}
+go_volcano <- EnhancedVolcano(sigsecgenes,
+                  lab = sigsecgenes$hgnc_symbol,
+                  x = 'log2FoldChange',
+                  y = 'pvalue',
+                  selectLab = volc_genes,
+                  FCcutoff = 1,
+                  pCutoff = 0.05,
+                  xlim = c(-2, 4.5),
+                  pointSize = 1,
+                  colCustom = keyvals.colour2,
+                  labSize = 2.5,
+                  title = '',
+                  subtitle = "",
+                  legendPosition = "none",
+                  colAlpha = 1,
+                  drawConnectors = F,
+                  widthConnectors = 0.5,
+                 # colConnectors = 'black',
+                  boxedLabels = F,
+                  legendLabSize = 10,
+                  legendIconSize = 4.0,
+                 gridlines.minor = F,
+                 gridlines.major = F)
+
+
+go_volcano
+
+#ggsave("transbato_volcano2.svg",go_volcano2,height = 5, width = 10)
+```
+
+
+#### Calculations for PCA of all genes vs secreted genes.
+```{r}
+# PCA calculations
+
+pca_all <- prcomp(t(rld_mat))
+pca_all_df <- cbind(coldata, pca_all$x)
+
+rldgenes <-as.data.frame(rownames(rld_mat))
+sectrimmed <- inner_join(secprot,rldgenes,by=c("ensemblid"="rownames(rld_mat)"))
+
+rldsec <- rld_mat[sectrimmed$ensemblid,] %>% t()
+pca_sec <- prcomp(rldsec)
+dfsec <- cbind(coldata, pca_sec$x)
+
+```
+
+#### Plots to compare PCA using all genes vs secreted genes. 
+```{r}
+# PCA comparison plot
+
+percentVar_all <- round(100 * summary(pca_all)$importance[2,])
+pca_allgenes <- ggplot(pca_all_df) + 
+  geom_point(aes(x=PC1, y=PC2, color = condition,shape=subject)) + 
+  xlab(paste0("PC1: ",percentVar_all[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar_all[2],"% variance")) + 
+  geom_vline(xintercept = 0,linetype = 2,colour="grey") + 
+  theme_few() + theme(legend.position="none") +
+  scale_colour_few("Dark") +
+  ggtitle("PCA using all genes (n = 60671)")
+
+
+percentVar_sec <- round(100 * summary(pca_sec)$importance[2,])
+pca_secgenes <- ggplot(dfsec) + 
+  geom_point(aes(x=PC1, y=PC2, color = condition,shape=subject)) + 
+  xlab(paste0("PC1: ",percentVar_sec[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar_sec[2],"% variance")) +  
+  geom_vline(xintercept = 0,linetype = 2,colour="grey") + 
+  theme_few() +
+  scale_colour_few("Dark") +
+  ggtitle("PCA using secreted genes (n = 2639)")
+
+
+
+pcafig <- pca_allgenes / pca_secgenes
+pcafig
+
+#ggsave('transbato_pca.png',pcafig,height=4,width=4*1.62)
+
+```
+
+#### Heatmap analysis of TGF family members to see change in expression
+```{r}
+# TGF beta family members
+
+tgf_fam <- read_csv("tgfbeta_family_list.txt",col_names = FALSE)
+
+tgf_list <- getBM(filters= "hgnc_symbol", attributes= c("ensembl_gene_id","hgnc_symbol","gene_biotype","description"),values=tgf_fam$X1,mart= mart)
+
+de_list_all <- merge(siggenedf,G_list,by.x="ensemblid",by.y="ensembl_gene_id")
+
+fft <- de_list_all$ensemblid %in% tgf_list$ensembl_gene_id
+
+#DE list of TGF family
+tgf_de <- de_list_all[fft,]
+
+normcount_tgf <- normalized_counts[tgf_de$ensemblid,]
+rownames(normcount_tgf) <- tgf_de$hgnc_symbol
+
+# manually set heatmap column order
+normcount_tgf <- normcount_tgf[,c(1,3,5,7,2,4,6,8)]
+
+heat.colors <- brewer.pal(5, "RdYlGn")
+
+pheatmap(normcount_tgf, color = heat.colors, cluster_rows = T,  show_rownames=T, cluster_cols = F, border_color=NA, fontsize = 10, scale="row",fontsize_row = 10, annotation_col = my_sample_col,gaps_col = c(4),show_colnames = F, annotation_names_col=F)
+
+```
+
+
+#### Counts for FSTL3
+```{r}
+# counts for FSTL3
+
+nct <- data.frame(ensemblid = row.names(normalized_counts), normalized_counts,stringsAsFactors=FALSE)
+rownames(nct) <- NULL
+nct %>% filter_all(any_vars(. %in% c('ENSG00000070404')))
+
+
+res <- results(dds)
+design <- as.data.frame(colData(dds))
+fstl3_count_fig <- degPlot(dds = dds, res = res, genes = c("ENSG00000070404"),xs = "condition",log2=F,xsLab="Norepinephrine treatment")
+
+fstl3_count_fig
+
+#ggsave('transbato_fstl3_normcount.png',fstl3_count_fig,height=4,width=4*0.6)
+```
+
+
+
+```{r}
+sessionInfo()
+```
+
